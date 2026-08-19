@@ -1,129 +1,88 @@
 import os
-import json
-import logging
 import asyncio
-from datetime import datetime
-import pytz
+import logging
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
+from aiohttp import web
 from google import genai
 
-# ================= SOZLAMALAR =================
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-TARGET_CHAT_ID = os.getenv("TARGET_CHAT_ID")
+logging.basicConfig(level=logging.INFO)
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+TARGET_CHAT_ID = os.environ.get("TARGET_CHAT_ID")
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
-TASHKENT_TZ = pytz.timezone("Asia/Tashkent")
+async def handle_ping(request):
+    return web.Response(text="Bot is active and running!")
 
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", handle_ping)
+    app.router.add_get("/healthz", handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logging.info(f"Veb server {port}-portda ishga tushdi.")
 
-# ================= GEMINI GENERATSIYA =================
-def generate_batch_tests(batch_num: int, count: int = 10):
-    prompt = f"""
-    O'zbekiston tarixi va Jahon tarixidan Kasbiy Toifa (attestatsiya) imtihonlari darajasidagi {count} ta murakkab va yangi test savolini tuzing.
-    
-    Qat'iy talab: Faqat quyidagi JSON formatida toza massiv qaytaring:
-    [
-      {{
-        "question": "Savol matni...",
-        "options": ["Variant A", "Variant B", "Variant C", "Variant D"],
-        "correct_index": 0,
-        "explanation": "To'g'ri javobning qisqa ilmiy izohi"
-      }}
-    ]
-    """
+async def generate_and_send_test():
+    prompt = (
+        "O'zbekiston va jahon tarixi fanidan toifa / attestatsiya imtihoniga tushadigan "
+        "darajadagi bitta qiyin va qiziqarli test savolini tuzib ber. "
+        "Javobni quyidagi JSON formatida qaytar:\n"
+        "{\n"
+        '  "question": "Savol matni",\n'
+        '  "options": ["A variant", "B variant", "C variant", "D variant"],\n'
+        '  "correct_option_id": 0,\n'
+        '  "explanation": "Izoh"\n'
+        "}\n"
+        "Faqat JSON qaytar, boshqa ortiqcha matn yozma."
+    )
     try:
         response = ai_client.models.generate_content(
-            model='gemini-2.0-flash',
+            model='gemini-2.5-flash',
             contents=prompt,
-            config={'response_mime_type': 'application/json'}
         )
-        return json.loads(response.text)
-    except Exception as e:
-        logging.error(f"Partiya {batch_num} da xatolik: {e}")
-        return []
+        import json
+        clean_text = response.text.replace("`json", "").replace("```", "").strip()
+        data = json.loads(clean_text)
 
-
-# ================= TESTLARNI KANALGA YUBORISH =================
-async def send_daily_quiz_pack():
-    logging.info("Kunlik 50 ta testni yuklash boshlandi...")
-    
-    try:
-        await bot.send_message(
+        await bot.send_poll(
             chat_id=TARGET_CHAT_ID,
-            text="🌅 **Assalomu alaykum, hurmatli ustozlar!**\n\n"
-                 "Bugungi kunlik 50 ta Kasbiy Toifa (attestatsiya) testlari boshlanmoqda.\n"
-                 "O'z bilimingizni sinab ko'ring! 👇",
-            parse_mode="Markdown"
+            question=data["question"],
+            options=data["options"],
+            type="quiz",
+            correct_option_id=data["correct_option_id"],
+            explanation=data.get("explanation", ""),
+            is_anonymous=False
         )
+        logging.info("Test muvaffaqiyatli yuborildi.")
     except Exception as e:
-        logging.error(f"Kanalga yozishda xatolik: {e}")
+        logging.error(f"Xatolik: {e}")
 
-    total_sent = 0
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    await message.answer("Tarix toifa test boti faol!")
 
-    for batch_num in range(1, 6):
-        tests = generate_batch_tests(batch_num=batch_num, count=10)
-        
-        for q in tests:
-            total_sent += 1
-            try:
-                question_text = f"[{total_sent}/50] {q['question']}"[:300]
-                options = [str(opt)[:100] for opt in q['options']]
-                explanation = str(q.get('explanation', ''))[:200]
-                
-                await bot.send_poll(
-                    chat_id=TARGET_CHAT_ID,
-                    question=question_text,
-                    options=options,
-                    type='quiz',
-                    correct_option_id=int(q['correct_index']),
-                    explanation=explanation if explanation else None,
-                    is_anonymous=False
-                )
-                await asyncio.sleep(1.5)
-            except Exception as err:
-                logging.error(f"Test yuborishda xatolik: {err}")
-        
-        await asyncio.sleep(2)
-
-    logging.info(f"Jami {total_sent} ta test joylandi!")
-
-
-# ================= VAQTNI BOSHQARISH (06:00 TASHKENT) =================
-async def scheduler_task():
-    sent_today = False
-    while True:
-        now_tashkent = datetime.now(TASHKENT_TZ)
-        
-        if now_tashkent.hour == 6 and now_tashkent.minute == 0 and not sent_today:
-            await send_daily_quiz_pack()
-            sent_today = True
-        
-        if now_tashkent.hour == 6 and now_tashkent.minute > 0:
-            sent_today = False
-            
-        await asyncio.sleep(20)
-
-
-# ================= ADMIN BUYRUQLARI =================
 @dp.message(Command("send_now"))
 async def cmd_send_now(message: types.Message):
-    await message.answer("50 ta test generatsiya qilinib, kanalga jo'natilmoqda...")
-    await send_daily_quiz_pack()
-    await message.answer("Testlar kanalga to'liq joylandi!")
+    await message.answer("Test yuborilmoqda...")
+    await generate_and_send_test()
+    await message.answer("Test kanalga yuborildi!")
 
+async def schedule_loop():
+    while True:
+        await asyncio.sleep(3600)
 
-# ================= ASOSIY MAIN =================
 async def main():
-    asyncio.create_task(scheduler_task())
-    logging.info("Bot serverda muvaffaqiyatli ishga tushdi.")
+    await start_web_server()
+    asyncio.create_task(schedule_loop())
     await dp.start_polling(bot)
 
-if __name__ == "__main__":
+if name == "main":
     asyncio.run(main())
-    
