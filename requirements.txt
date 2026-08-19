@@ -1,5 +1,4 @@
-aiogram>=3.17.0
-google-genai>=1.0.0
-schedule>=1.2.0
-pydantic>=2.0
-pytz
+aiogram>=3.0.0
+google-genai
+schedule
+aiohttp
