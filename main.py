@@ -33,35 +33,46 @@ async def start_web_server():
 
 async def generate_and_send_test():
     prompt = (
-        "O'zbekiston va jahon tarixi fanidan toifa / attestatsiya imtihoniga tushadigan "
-        "darajadagi bitta qiyin va qiziqarli test savolini tuzib ber. "
-        "Javobni quyidagi JSON formatida qaytar:\n"
+        "O'zbekiston va jahon tarixi fanidan toifa/attestatsiya imtihoni uchun 1 dona qiyin va qiziqarli test savolini tuzib ber.\n"
+        "Qat'iy qoidalar:\n"
+        "1. Savol matni 250 belgidan oshmasin.\n"
+        "2. Har bir javob varianti QISQA bo'lsin, uzunligi MAKSIMAL 80 belgidan oshmasin!\n"
+        "3. Izoh 150 belgidan oshmasin.\n\n"
+        "Javobni faqat va faqat quyidagi JSON formatida qaytar:\n"
         "{\n"
         '  "question": "Savol matni",\n'
         '  "options": ["A variant", "B variant", "C variant", "D variant"],\n'
         '  "correct_option_id": 0,\n'
-        '  "explanation": "Izoh"\n'
+        '  "explanation": "Qisqa izoh"\n'
         "}\n"
-        "Faqat JSON qaytar, boshqa ortiqcha matn yozma."
+        "Hech qanday ortiqcha matn yozma, faqat toza JSON."
     )
     try:
         response = ai_client.models.generate_content(
             model='gemini-3.6-flash',
             contents=prompt,
         )
-        clean_text = response.text.replace("`json", "").replace("```", "").strip()
+        clean_text = response.text.replace("```json", "").replace("```", "").strip()
         data = json.loads(clean_text)
+
+        # Telegram cheklovlari uchun variantlar uzunligini qirqish
+        question = data["question"][:255]
+        options = [opt[:99] for opt in data["options"][:10]]
+        correct_id = int(data.get("correct_option_id", 0))
+        if correct_id >= len(options):
+            correct_id = 0
+        explanation = data.get("explanation", "")[:200]
 
         await bot.send_poll(
             chat_id=TARGET_CHAT_ID,
-            question=data["question"],
-            options=data["options"],
+            question=question,
+            options=options,
             type="quiz",
-            correct_option_id=data["correct_option_id"],
-            explanation=data.get("explanation", ""),
+            correct_option_id=correct_id,
+            explanation=explanation if explanation else None,
             is_anonymous=False
         )
-        logging.info("Test muvaffaqiyatli yuborildi.")
+        logging.info("Test kanalda muvaffaqiyatli chop etildi!")
     except Exception as e:
         logging.error(f"Xatolik: {e}")
 
