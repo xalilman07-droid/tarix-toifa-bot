@@ -36,8 +36,8 @@ async def generate_and_send_test():
         "O'zbekiston va jahon tarixi fanidan toifa/attestatsiya imtihoni uchun 1 dona qiyin va qiziqarli test savolini tuzib ber.\n"
         "Qat'iy qoidalar:\n"
         "1. Savol matni 250 belgidan oshmasin.\n"
-        "2. Har bir javob varianti QISQA bo'lsin, uzunligi MAKSIMAL 80 belgidan oshmasin!\n"
-        "3. Izoh 150 belgidan oshmasin.\n\n"
+        "2. Har bir javob varianti QISQA bo'lsin, maksimal 80 belgidan oshmasin.\n"
+        "3. Izoh maksimal 150 belgidan oshmasin.\n\n"
         "Javobni faqat va faqat quyidagi JSON formatida qaytar:\n"
         "{\n"
         '  "question": "Savol matni",\n'
@@ -45,23 +45,29 @@ async def generate_and_send_test():
         '  "correct_option_id": 0,\n'
         '  "explanation": "Qisqa izoh"\n'
         "}\n"
-        "Hech qanday ortiqcha matn yozma, faqat toza JSON."
+        "Hech qanday boshqa matn qo'shma."
     )
     try:
         response = ai_client.models.generate_content(
             model='gemini-3.6-flash',
             contents=prompt,
         )
-        clean_text = response.text.replace("`json", "").replace("```", "").strip()
-        data = json.loads(clean_text)
+        raw_text = response.text.strip()
+        if "
+            raw_text = raw_text.split("
+json")[1].split("
+        elif "
+" in raw_text:
+            raw_text = raw_text.split("`")[1].split("```")[0].strip()
 
-        # Telegram cheklovlari uchun variantlar uzunligini qirqish
+        data = json.loads(raw_text)
+
         question = data["question"][:255]
         options = [opt[:99] for opt in data["options"][:10]]
         correct_id = int(data.get("correct_option_id", 0))
         if correct_id >= len(options):
             correct_id = 0
-        explanation = data.get("explanation", "")[:200]
+        explanation = data.get("explanation", "")[:199]
 
         await bot.send_poll(
             chat_id=TARGET_CHAT_ID,
@@ -70,9 +76,9 @@ async def generate_and_send_test():
             type="quiz",
             correct_option_id=correct_id,
             explanation=explanation if explanation else None,
-            is_anonymous=False
+            is_anonymous=True
         )
-        logging.info("Test kanalda muvaffaqiyatli chop etildi!")
+        logging.info("Test muvaffaqiyatli kanalga yuborildi!")
     except Exception as e:
         logging.error(f"Xatolik: {e}")
 
@@ -94,6 +100,6 @@ async def main():
     await start_web_server()
     asyncio.create_task(schedule_loop())
     await dp.start_polling(bot)
-
+    
 if __name__ == "__main__":
     asyncio.run(main())
