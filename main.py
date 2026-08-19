@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+import json
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiohttp import web
@@ -48,7 +49,6 @@ async def generate_and_send_test():
             model='gemini-2.5-flash',
             contents=prompt,
         )
-        import json
         clean_text = response.text.replace("`json", "").replace("```", "").strip()
         data = json.loads(clean_text)
 
