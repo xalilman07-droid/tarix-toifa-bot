@@ -18,7 +18,7 @@ dp = Dispatcher()
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
 async def handle_ping(request):
-    return web.Response(text="Bot is active and running!")
+    return web.Response(text="Bot is running!")
 
 async def start_web_server():
     app = web.Application()
@@ -33,41 +33,38 @@ async def start_web_server():
 
 async def generate_and_send_test():
     prompt = (
-        "O'zbekiston va jahon tarixi fanidan toifa/attestatsiya imtihoni uchun 1 dona qiyin va qiziqarli test savolini tuzib ber.\n"
-        "Qat'iy qoidalar:\n"
-        "1. Savol matni 250 belgidan oshmasin.\n"
-        "2. Har bir javob varianti QISQA bo'lsin, maksimal 80 belgidan oshmasin.\n"
-        "3. Izoh maksimal 150 belgidan oshmasin.\n\n"
-        "Javobni faqat va faqat quyidagi JSON formatida qaytar:\n"
+        "O'zbekiston va jahon tarixi fanidan toifa imtihoni uchun 1 ta qiyin test savolini tuzib ber.\n"
+        "Qoidalar:\n"
+        "1. Savol 250 belgidan oshmasin.\n"
+        "2. Har bir variant 80 belgidan oshmasin.\n"
+        "3. Izoh 150 belgidan oshmasin.\n"
+        "Faqat quyidagi JSON formatida qaytar:\n"
         "{\n"
         '  "question": "Savol matni",\n'
-        '  "options": ["A variant", "B variant", "C variant", "D variant"],\n'
+        '  "options": ["A", "B", "C", "D"],\n'
         '  "correct_option_id": 0,\n'
-        '  "explanation": "Qisqa izoh"\n'
-        "}\n"
-        "Hech qanday boshqa matn qo'shma."
+        '  "explanation": "Izoh"\n'
+        "}"
     )
     try:
         response = ai_client.models.generate_content(
             model='gemini-3.6-flash',
             contents=prompt,
         )
-        raw_text = response.text.strip()
-        if "
-            raw_text = raw_text.split("
-json")[1].split("
-        elif "
-" in raw_text:
-            raw_text = raw_text.split("`")[1].split("```")[0].strip()
+        text = response.text.strip()
+        start = text.find("{")
+        end = text.rfind("}") + 1
+        if start != -1 and end != 0:
+            text = text[start:end]
 
-        data = json.loads(raw_text)
+        data = json.loads(text)
 
-        question = data["question"][:255]
-        options = [opt[:99] for opt in data["options"][:10]]
+        question = str(data.get("question", "Tarix testi"))[:255]
+        options = [str(opt)[:99] for opt in data.get("options", [])[:10]]
         correct_id = int(data.get("correct_option_id", 0))
-        if correct_id >= len(options):
+        if correct_id >= len(options) or correct_id < 0:
             correct_id = 0
-        explanation = data.get("explanation", "")[:199]
+        explanation = str(data.get("explanation", ""))[:199]
 
         await bot.send_poll(
             chat_id=TARGET_CHAT_ID,
@@ -75,10 +72,10 @@ json")[1].split("
             options=options,
             type="quiz",
             correct_option_id=correct_id,
-            explanation=explanation if explanation else None,
+            explanation=explanation if len(explanation) > 0 else None,
             is_anonymous=True
         )
-        logging.info("Test muvaffaqiyatli kanalga yuborildi!")
+        logging.info("Test kanalga yuborildi!")
     except Exception as e:
         logging.error(f"Xatolik: {e}")
 
@@ -90,16 +87,11 @@ async def cmd_start(message: types.Message):
 async def cmd_send_now(message: types.Message):
     await message.answer("Test yuborilmoqda...")
     await generate_and_send_test()
-    await message.answer("Test kanalga yuborildi!")
-
-async def schedule_loop():
-    while True:
-        await asyncio.sleep(3600)
+    await message.answer("Jarayon yakunlandi!")
 
 async def main():
     await start_web_server()
-    asyncio.create_task(schedule_loop())
     await dp.start_polling(bot)
-    
+
 if __name__ == "__main__":
     asyncio.run(main())
