@@ -52,7 +52,7 @@ async def generate_and_send_test():
             model='gemini-3.6-flash',
             contents=prompt,
         )
-        clean_text = response.text.replace("```json", "").replace("```", "").strip()
+        clean_text = response.text.replace("`json", "").replace("```", "").strip()
         data = json.loads(clean_text)
 
         # Telegram cheklovlari uchun variantlar uzunligini qirqish
