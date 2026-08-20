@@ -2,18 +2,20 @@ import os
 import asyncio
 import json
 import logging
+import re
 from datetime import datetime, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from aiohttp import web
-from aiogram import Bot, Dispatcher, types
-from aiogram.filters import Command
+from aiogram import Bot, Dispatcher
+from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest
 from google import genai
 from google.genai import types as genai_types
 
 
 # ============================================================
-# SOZLAMALAR
+# LOGGING
 # ============================================================
 
 logging.basicConfig(
@@ -23,22 +25,30 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
+
+# ============================================================
+# ENV VARIABLES
+# ============================================================
+
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TARGET_CHAT_ID = os.getenv("TARGET_CHAT_ID")
 
-# Har kuni qaysi vaqtda boshlansin
 SEND_HOUR = int(os.getenv("SEND_HOUR", "8"))
 SEND_MINUTE = int(os.getenv("SEND_MINUTE", "0"))
 
-# Bir kunda nechta test
-DAILY_TEST_COUNT = 50
+DAILY_TEST_COUNT = int(os.getenv("DAILY_TEST_COUNT", "50"))
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "10"))
 
-# Bir Gemini so'rovida nechta test
-BATCH_SIZE = 10
+# Telegram poll yuborish oralig'i.
+# Xavfsizroq ishlashi uchun 3 soniya.
+SEND_DELAY = float(os.getenv("SEND_DELAY", "3"))
 
 # Toshkent vaqti
 UZ_TZ = ZoneInfo("Asia/Tashkent")
+
+# Holat saqlanadigan fayl
+STATE_FILE = Path("bot_state.json")
 
 
 # ============================================================
@@ -46,26 +56,29 @@ UZ_TZ = ZoneInfo("Asia/Tashkent")
 # ============================================================
 
 if not BOT_TOKEN:
-    raise RuntimeError(
-        "TELEGRAM_BOT_TOKEN topilmadi!"
-    )
+    raise RuntimeError("TELEGRAM_BOT_TOKEN topilmadi!")
 
 if not GEMINI_API_KEY:
-    raise RuntimeError(
-        "GEMINI_API_KEY topilmadi!"
-    )
+    raise RuntimeError("GEMINI_API_KEY topilmadi!")
 
 if not TARGET_CHAT_ID:
-    raise RuntimeError(
-        "TARGET_CHAT_ID topilmadi!"
-    )
+    raise RuntimeError("TARGET_CHAT_ID topilmadi!")
+
+if DAILY_TEST_COUNT <= 0:
+    raise RuntimeError("DAILY_TEST_COUNT 0 dan katta bo'lishi kerak!")
+
+if BATCH_SIZE <= 0:
+    raise RuntimeError("BATCH_SIZE 0 dan katta bo'lishi kerak!")
 
 
 # ============================================================
-# BOT / GEMINI
+# BOT VA GEMINI
 # ============================================================
 
 bot = Bot(token=BOT_TOKEN)
+
+# Dispatcher qoldiriladi.
+# Hozir buyruq ishlatmasak ham polling barqaror ishlashi uchun.
 dp = Dispatcher()
 
 gemini = genai.Client(
@@ -74,13 +87,105 @@ gemini = genai.Client(
 
 
 # ============================================================
-# STATISTIKA
+# GLOBAL HOLAT
 # ============================================================
 
+# Bir vaqtda faqat BITTA yuborish ishlashi uchun.
+send_lock = asyncio.Lock()
+
+# Hozir yuborish jarayoni ketayotganini ko'rsatadi.
+is_sending = False
+
+# Statistika
+today_sent = 0
 last_run_date = None
 last_run_time = None
 last_error = None
-today_sent = 0
+
+
+# ============================================================
+# STATE SAQLASH
+# ============================================================
+
+def load_state():
+    global today_sent
+    global last_run_date
+    global last_run_time
+    global last_error
+
+    if not STATE_FILE.exists():
+        logger.info("State fayli hali mavjud emas.")
+        return
+
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as file:
+            data = json.load(file)
+
+        last_date = data.get("last_run_date")
+        last_time = data.get("last_run_time")
+
+        if last_date:
+            last_run_date = datetime.fromisoformat(
+                last_date
+            ).date()
+
+        if last_time:
+            last_run_time = datetime.fromisoformat(
+                last_time
+            )
+
+        today_sent = int(
+            data.get("today_sent", 0)
+        )
+
+        last_error = data.get("last_error")
+
+        logger.info(
+            "Avvalgi bot holati yuklandi."
+        )
+
+    except Exception as error:
+        logger.exception(
+            f"State yuklashda xato: {error}"
+        )
+
+
+def save_state():
+    try:
+        data = {
+            "last_run_date": (
+                last_run_date.isoformat()
+                if last_run_date
+                else None
+            ),
+
+            "last_run_time": (
+                last_run_time.isoformat()
+                if last_run_time
+                else None
+            ),
+
+            "today_sent": today_sent,
+
+            "last_error": last_error
+        }
+
+        with open(
+            STATE_FILE,
+            "w",
+            encoding="utf-8"
+        ) as file:
+            json.dump(
+                data,
+                file,
+                ensure_ascii=False,
+                indent=2
+            )
+
+    except Exception as error:
+        logger.exception(
+            f"State saqlashda xato: {error}"
+        )
 
 
 # ============================================================
@@ -88,12 +193,17 @@ today_sent = 0
 # ============================================================
 
 async def home(request):
+
     return web.Response(
-        text="Tarix Toifa Test Bot ishlayapti!"
+        text=(
+            "Tarix Toifa Test Bot ishlayapti! "
+            "Avtomatik rejim: AKTIV"
+        )
     )
 
 
 async def health(request):
+
     return web.Response(
         text="OK"
     )
@@ -107,6 +217,7 @@ async def start_web_server():
     app.router.add_get("/healthz", health)
 
     runner = web.AppRunner(app)
+
     await runner.setup()
 
     port = int(
@@ -124,6 +235,8 @@ async def start_web_server():
     logger.info(
         f"Web server {port}-portda ishga tushdi."
     )
+
+    return runner
 
 
 # ============================================================
@@ -145,7 +258,9 @@ TEST_SCHEMA = {
                         "type": "array",
                         "items": {
                             "type": "string"
-                        }
+                        },
+                        "minItems": 4,
+                        "maxItems": 4
                     },
                     "correct_option_id": {
                         "type": "integer"
@@ -176,25 +291,47 @@ TEST_SCHEMA = {
 def build_prompt(batch_number):
 
     if batch_number % 2 == 1:
+
         topic_instruction = """
 Bu blokda O'ZBEKISTON TARIXI ustun bo'lsin.
-Qadimgi davr, o'rta asrlar, xonliklar,
-Rossiya imperiyasi davri, jadidchilik,
-sovet davri va mustaqillik davrini aralashtir.
+
+Quyidagi davrlarni muvozanatli aralashtir:
+- qadimgi davr
+- ilk va rivojlangan o'rta asrlar
+- Amir Temur va Temuriylar
+- xonliklar
+- Rossiya imperiyasi davri
+- jadidchilik
+- sovet davri
+- mustaqillik davri
 """
+
     else:
+
         topic_instruction = """
 Bu blokda JAHON TARIXI ustun bo'lsin.
-Qadimgi Sharq, Yunoniston, Rim,
-o'rta asrlar, Uyg'onish, Buyuk geografik kashfiyotlar,
-sanoat inqilobi, jahon urushlari va XX asr tarixini aralashtir.
+
+Quyidagi davrlarni muvozanatli aralashtir:
+- Qadimgi Sharq
+- Yunoniston
+- Rim
+- o'rta asrlar
+- Uyg'onish
+- Buyuk geografik kashfiyotlar
+- sanoat inqilobi
+- XVIII-XIX asrlar
+- Birinchi jahon urushi
+- Ikkinchi jahon urushi
+- XX asr tarixi
 """
 
+
     return f"""
-SEN — tarix fanidan O'zbekiston Respublikasidagi
+SEN O'zbekiston Respublikasidagi tarix fanidan
 TOIFA IMTIHONI uchun professional test tuzuvchi ekspertisan.
 
-Bugungi kun uchun 10 ta yangi test savoli yarat.
+{BATCH_SIZE} ta YANGI va BIR-BIRIDAN FARQLI
+tarix testini yarat.
 
 Bu {batch_number}-blok.
 
@@ -202,60 +339,178 @@ Bu {batch_number}-blok.
 
 MUHIM TALABLAR:
 
-1. Har bir savol professional toifa imtihoni darajasida bo'lsin.
-2. Savollar oddiy "kim?", "qachon?" yodlash savollaridan
-   ko'ra tahliliy va sabab-oqibatli bo'lishiga ustuvorlik ber.
-3. Xronologiya, moslashtirish, tarixiy sabab-oqibat,
-   davlatlar siyosati, islohotlar, tarixiy shaxslar,
-   hujjatlar va muhim voqealardan foydalan.
-4. Savollar bir-biriga o'xshamasin.
-5. Bir xil savol yoki bir xil javob kombinatsiyasini takrorlama.
-6. O'zbekiston tarixi va jahon tarixini muvozanatli qamrab ol.
-7. Tarixiy faktlarni uydirma qilma.
-8. Sana va ism-shariflarni imkon qadar aniq yoz.
-9. Har bir savolda A, B, C, D — aynan 4 ta variant bo'lsin.
-10. Faqat BITTA to'g'ri javob bo'lsin.
-11. correct_option_id:
-    A = 0
-    B = 1
-    C = 2
-    D = 3
-12. Savol 300 belgidan oshmasin.
-13. Har bir variant 100 belgidan oshmasin.
-14. Izoh 200 belgidan oshmasin.
-15. Noto'g'ri variantlar mantiqan ishonarli bo'lsin.
-16. To'g'ri javobni boshqa variantlardan grammatik yoki
-    uzunlik jihatdan juda oson ajratib bo'lmasin.
-17. Testlar o'zbek adabiy tilida bo'lsin.
-18. Savollarni bugungi boshqa bloklardagi savollardan farqli qil.
-19. 10 ta testning o'zida ham mavzularni takrorlama.
+1. Savollar tarix fanidan TOIFA IMTIHONI darajasida bo'lsin.
 
-Faqat JSON qaytar.
+2. Oddiy yodlash savollaridan ko'ra quyidagilarga ustuvorlik ber:
+   - sabab va oqibat
+   - xronologik tahlil
+   - voqealarni taqqoslash
+   - tarixiy jarayonlarni bog'lash
+   - davlat siyosati
+   - islohotlar
+   - tarixiy hujjatlar
+   - tarixiy shaxslar faoliyatini tahlil qilish
 
-JSON quyidagi shaklda bo'lishi shart:
+3. Tarixiy faktlarni uydirma qilma.
+
+4. Sana, ism, joy va voqealarni imkon qadar aniq yoz.
+
+5. Har bir savolda aynan 4 ta variant bo'lsin.
+
+6. Variantlar A, B, C, D deb yozilmasin.
+   Faqat variant matnlarini massivga joylashtir.
+
+7. Faqat BITTA to'g'ri javob bo'lsin.
+
+8. correct_option_id qiymati:
+   0 = birinchi variant
+   1 = ikkinchi variant
+   2 = uchinchi variant
+   3 = to'rtinchi variant
+
+9. Noto'g'ri variantlar mantiqan ishonarli bo'lsin.
+
+10. To'g'ri javob uzunligi yoki grammatikasi orqali
+    juda oson bilinib qolmasin.
+
+11. Savollar bir-birini takrorlamasin.
+
+12. Bir xil tarixiy voqeani turli so'zlar bilan
+    qayta savol qilma.
+
+13. Savol 300 belgidan oshmasin.
+
+14. Har bir variant 100 belgidan oshmasin.
+
+15. explanation 200 belgidan oshmasin.
+
+16. explanation juda muhim:
+    foydalanuvchi javob bergandan keyin
+    nima uchun aynan shu javob to'g'ri ekanini
+    qisqa va tushunarli tarzda izohlasin.
+
+17. Testlar sof va tushunarli o'zbek adabiy tilida bo'lsin.
+
+18. Faqat JSON qaytar.
+
+JSON formati:
 
 {{
   "tests": [
     {{
-      "question": "Savol",
+      "question": "Savol matni",
       "options": [
-        "A variant",
-        "B variant",
-        "C variant",
-        "D variant"
+        "1-variant",
+        "2-variant",
+        "3-variant",
+        "4-variant"
       ],
       "correct_option_id": 0,
-      "explanation": "Qisqa tarixiy izoh"
+      "explanation": "To'g'ri javobning qisqa tarixiy izohi"
     }}
   ]
 }}
 
-Aynan 10 ta test yarat.
+Aynan {BATCH_SIZE} ta test yarat.
 """
 
 
 # ============================================================
-# GEMINI'DAN 10 TA TEST OLISH
+# TEST VALIDATSIYASI
+# ============================================================
+
+def validate_test(item):
+
+    try:
+
+        question = str(
+            item["question"]
+        ).strip()
+
+        options = item["options"]
+
+        correct_id = int(
+            item["correct_option_id"]
+        )
+
+        explanation = str(
+            item.get(
+                "explanation",
+                ""
+            )
+        ).strip()
+
+
+        if not isinstance(
+            options,
+            list
+        ):
+            return None
+
+
+        options = [
+            str(option).strip()
+            for option in options
+        ]
+
+
+        if len(question) < 10:
+            return None
+
+        if len(question) > 300:
+            return None
+
+
+        if len(options) != 4:
+            return None
+
+
+        if any(
+            len(option) < 1
+            or len(option) > 100
+            for option in options
+        ):
+            return None
+
+
+        if len(set(
+            option.lower()
+            for option in options
+        )) != 4:
+            return None
+
+
+        if correct_id not in (
+            0,
+            1,
+            2,
+            3
+        ):
+            return None
+
+
+        if len(explanation) < 5:
+            return None
+
+
+        explanation = explanation[:200]
+
+
+        return {
+            "question": question,
+            "options": options,
+            "correct_option_id": correct_id,
+            "explanation": explanation
+        }
+
+
+    except Exception:
+
+        return None
+
+
+# ============================================================
+# GEMINI'DAN BATCH OLISH
 # ============================================================
 
 async def generate_batch(batch_number):
@@ -269,6 +524,7 @@ async def generate_batch(batch_number):
         f"tayyorlanmoqda..."
     )
 
+
     response = await asyncio.to_thread(
         gemini.models.generate_content,
         model="gemini-3.6-flash",
@@ -281,332 +537,498 @@ async def generate_batch(batch_number):
         )
     )
 
+
     if not response.text:
+
         raise ValueError(
             "Gemini bo'sh javob qaytardi!"
         )
 
+
     data = json.loads(
         response.text
     )
+
 
     tests = data.get(
         "tests",
         []
     )
 
-    if not isinstance(tests, list):
+
+    if not isinstance(
+        tests,
+        list
+    ):
+
         raise ValueError(
             "Gemini 'tests' massivini qaytarmadi!"
         )
 
+
     valid_tests = []
+
 
     for item in tests:
 
-        try:
+        test = validate_test(
+            item
+        )
 
-            question = str(
-                item["question"]
-            ).strip()
+        if test:
 
-            options = item["options"]
-
-            correct_id = int(
-                item["correct_option_id"]
+            valid_tests.append(
+                test
             )
 
-            explanation = str(
-                item.get(
-                    "explanation",
-                    ""
-                )
-            ).strip()
-
-            if not isinstance(
-                options,
-                list
-            ):
-                continue
-
-            options = [
-                str(x).strip()
-                for x in options
-            ]
-
-            # Qattiq tekshiruv
-            if len(question) < 10:
-                continue
-
-            if len(question) > 300:
-                continue
-
-            if len(options) != 4:
-                continue
-
-            if any(
-                len(x) < 1 or len(x) > 100
-                for x in options
-            ):
-                continue
-
-            if correct_id not in [0, 1, 2, 3]:
-                continue
-
-            explanation = explanation[:200]
-
-            valid_tests.append({
-                "question": question,
-                "options": options,
-                "correct_option_id": correct_id,
-                "explanation": explanation
-            })
-
-        except Exception:
-            continue
 
     logger.info(
         f"{batch_number}-blokdan "
         f"{len(valid_tests)} ta sifatli test olindi."
     )
 
+
     return valid_tests
 
 
 # ============================================================
-# TESTLARNI TAKRORLANISHDAN TOZALASH
+# TAKRORLANISHLARNI TOZALASH
 # ============================================================
+
+def normalize_question(text):
+
+    text = text.lower()
+
+    text = re.sub(
+        r"[^a-zA-Z0-9ʻ’'ʻʼo‘g‘ ]",
+        "",
+        text
+    )
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text
+    ).strip()
+
+    return text
+
 
 def remove_duplicates(tests):
 
-    unique = []
+    unique_tests = []
+
     seen = set()
+
 
     for test in tests:
 
-        key = (
+        key = normalize_question(
             test["question"]
-            .lower()
-            .replace(" ", "")
-            .replace(".", "")
-            .replace(",", "")
-            .replace("?", "")
         )
+
+
+        if not key:
+            continue
+
 
         if key in seen:
             continue
 
-        seen.add(key)
-        unique.append(test)
 
-    return unique
+        seen.add(
+            key
+        )
+
+        unique_tests.append(
+            test
+        )
+
+
+    return unique_tests
 
 
 # ============================================================
-# 50 TA TEST TAYYORLASH
+# KERAKLI MIQDORDA TEST YARATISH
 # ============================================================
 
-async def generate_50_tests():
+async def generate_daily_tests():
 
     all_tests = []
 
-    # 5 × 10 = 50
-    for batch in range(1, 6):
+    batches_needed = (
+        DAILY_TEST_COUNT
+        + BATCH_SIZE
+        - 1
+    ) // BATCH_SIZE
+
+
+    max_extra_batches = 5
+
+
+    for batch_number in range(
+        1,
+        batches_needed + max_extra_batches + 1
+    ):
+
+        if len(all_tests) >= DAILY_TEST_COUNT:
+            break
+
+
+        success = False
+
 
         for attempt in range(1, 4):
 
             try:
 
                 tests = await generate_batch(
-                    batch
+                    batch_number
                 )
 
                 all_tests.extend(
                     tests
                 )
 
-                break
-
-            except Exception as e:
-
-                logger.error(
-                    f"{batch}-blok, "
-                    f"{attempt}-urinish xato: {e}"
+                all_tests = remove_duplicates(
+                    all_tests
                 )
 
+                success = True
+
+                break
+
+
+            except Exception as error:
+
+                logger.exception(
+                    f"{batch_number}-blok, "
+                    f"{attempt}-urinish xatosi: "
+                    f"{error}"
+                )
+
+
                 if attempt < 3:
-                    await asyncio.sleep(5)
 
-    all_tests = remove_duplicates(
-        all_tests
-    )
+                    await asyncio.sleep(
+                        attempt * 5
+                    )
 
-    logger.info(
-        f"Jami noyob testlar: "
-        f"{len(all_tests)}"
-    )
 
-    # Yetarli bo'lmasa qayta generatsiya
-    if len(all_tests) < 50:
+        if not success:
 
-        logger.warning(
-            "50 ta test yig'ilmadi. "
-            "Qo'shimcha testlar yaratilmoqda..."
+            logger.warning(
+                f"{batch_number}-blok olinmadi."
+            )
+
+
+        logger.info(
+            f"Hozircha noyob testlar: "
+            f"{len(all_tests)}/"
+            f"{DAILY_TEST_COUNT}"
         )
 
-        extra = await generate_batch(
-            6
-        )
 
-        all_tests.extend(
-            extra
-        )
-
-        all_tests = remove_duplicates(
-            all_tests
-        )
-
-    if len(all_tests) < 50:
+    if len(all_tests) < DAILY_TEST_COUNT:
 
         raise RuntimeError(
-            f"50 ta test yaratib bo'lmadi. "
-            f"Faqat {len(all_tests)} ta mavjud."
+            f"Yetarli test yaratilmadi. "
+            f"{len(all_tests)}/"
+            f"{DAILY_TEST_COUNT}"
         )
 
-    return all_tests[:50]
+
+    return all_tests[
+        :DAILY_TEST_COUNT
+    ]
 
 
 # ============================================================
-# BITTA TESTNI TELEGRAMGA YUBORISH
+# BITTA TESTNI XAVFSIZ YUBORISH
 # ============================================================
 
-async def send_one_test(test, number):
+async def send_one_test(
+    test,
+    number
+):
 
-    await bot.send_poll(
-        chat_id=TARGET_CHAT_ID,
-        question=test["question"],
-        options=test["options"],
-        type="quiz",
-        correct_option_id=test[
-            "correct_option_id"
-        ],
-        explanation=(
-            test["explanation"]
-            if test["explanation"]
-            else None
-        ),
-        is_anonymous=True
+    max_attempts = 5
+
+
+    for attempt in range(
+        1,
+        max_attempts + 1
+    ):
+
+        try:
+
+            await bot.send_poll(
+
+                chat_id=TARGET_CHAT_ID,
+
+                question=test["question"],
+
+                options=test["options"],
+
+                type="quiz",
+
+                correct_option_id=test[
+                    "correct_option_id"
+                ],
+
+                # FOYDALANUVCHI JAVOB BERGACH
+                # Telegram shu izohni ko'rsatadi.
+                explanation=test[
+                    "explanation"
+                ],
+
+                is_anonymous=True
+            )
+
+
+            logger.info(
+                f"✅ {number}/"
+                f"{DAILY_TEST_COUNT} "
+                f"test yuborildi."
+            )
+
+
+            return True
+
+
+        except TelegramRetryAfter as error:
+
+            retry_seconds = int(
+                error.retry_after
+            ) + 2
+
+
+            logger.warning(
+                f"⚠️ Flood Control! "
+                f"{retry_seconds} soniya "
+                f"kutilmoqda..."
+            )
+
+
+            await asyncio.sleep(
+                retry_seconds
+            )
+
+
+        except TelegramBadRequest as error:
+
+            logger.error(
+                f"❌ {number}-test "
+                f"Telegram tomonidan rad etildi: "
+                f"{error}"
+            )
+
+            return False
+
+
+        except Exception as error:
+
+            logger.error(
+                f"❌ {number}-test, "
+                f"{attempt}-urinish xatosi: "
+                f"{error}"
+            )
+
+
+            if attempt < max_attempts:
+
+                await asyncio.sleep(
+                    attempt * 5
+                )
+
+
+    logger.error(
+        f"❌ {number}-test "
+        f"{max_attempts} urinishdan keyin "
+        f"yuborilmadi."
     )
 
-    logger.info(
-        f"✅ {number}/50 test yuborildi."
-    )
+
+    return False
 
 
 # ============================================================
-# 50 TA TESTNI KANALGA YUBORISH
+# KUNLIK TESTLARNI YUBORISH
 # ============================================================
 
 async def send_daily_tests():
 
+    global is_sending
+    global today_sent
     global last_run_date
     global last_run_time
     global last_error
-    global today_sent
 
-    now = datetime.now(
-        UZ_TZ
-    )
 
-    today = now.date()
+    # BIR VAQTNING O'ZIDA FAQAT BITTA
+    # YUBORISH JARAYONI BO'LISHI MUMKIN.
+    async with send_lock:
 
-    # Shu kun allaqachon yuborilgan bo'lsa,
-    # ikkinchi marta yubormaydi.
-    if last_run_date == today:
 
-        logger.warning(
-            "Bugungi 50 ta test allaqachon yuborilgan."
-        )
+        if is_sending:
 
-        return
+            logger.warning(
+                "Yuborish allaqachon davom etmoqda."
+            )
 
-    today_sent = 0
+            return
 
-    try:
 
-        logger.info(
-            "========================================"
-        )
+        is_sending = True
 
-        logger.info(
-            "🚀 BUGUNGI 50 TA TEST TAYYORLANMOQDA"
-        )
 
-        logger.info(
-            f"📅 Sana: {today}"
-        )
+        try:
 
-        logger.info(
-            "========================================"
-        )
+            now = datetime.now(
+                UZ_TZ
+            )
 
-        tests = await generate_50_tests()
+            today = now.date()
 
-        logger.info(
-            "50 ta test tayyor."
-        )
 
-        for index, test in enumerate(
-            tests,
-            start=1
-        ):
+            # Bugun muvaffaqiyatli yuborilgan bo'lsa
+            # ikkinchi marta yubormaydi.
+            if (
+                last_run_date == today
+                and today_sent >= DAILY_TEST_COUNT
+            ):
 
-            try:
+                logger.info(
+                    "Bugungi testlar allaqachon "
+                    "to'liq yuborilgan."
+                )
 
-                await send_one_test(
+                return
+
+
+            logger.info(
+                "========================================"
+            )
+
+            logger.info(
+                "🚀 KUNLIK TESTLAR "
+                "TAYYORLANMOQDA"
+            )
+
+            logger.info(
+                f"📅 Sana: {today}"
+            )
+
+            logger.info(
+                "========================================"
+            )
+
+
+            # Yangi kun uchun hisobni boshlash
+            today_sent = 0
+
+            save_state()
+
+
+            tests = await generate_daily_tests()
+
+
+            logger.info(
+                f"{len(tests)} ta test tayyor."
+            )
+
+
+            sent_count = 0
+
+
+            for index, test in enumerate(
+                tests,
+                start=1
+            ):
+
+                success = await send_one_test(
                     test,
                     index
                 )
 
-                today_sent += 1
 
-                # Telegram serverini ortiqcha
-                # bosmaslik uchun kichik pauza
-                await asyncio.sleep(1.2)
+                if success:
 
-            except Exception as e:
+                    sent_count += 1
 
-                logger.error(
-                    f"{index}/50 yuborilmadi: {e}"
+                    today_sent = sent_count
+
+                    # Har muvaffaqiyatli yuborishdan keyin
+                    # holat saqlanadi.
+                    save_state()
+
+
+                # Keyingi testgacha xavfsiz pauza
+                if index < len(tests):
+
+                    await asyncio.sleep(
+                        SEND_DELAY
+                    )
+
+
+            # Faqat hammasi muvaffaqiyatli yuborilganda
+            # kun bajarildi deb hisoblanadi.
+            if sent_count >= DAILY_TEST_COUNT:
+
+                last_run_date = today
+
+                last_run_time = datetime.now(
+                    UZ_TZ
                 )
 
-                # Bitta test xatosi qolgan 49 tasini
-                # to'xtatmasin.
-                await asyncio.sleep(3)
+                last_error = None
 
-        last_run_date = today
-        last_run_time = datetime.now(
-            UZ_TZ
-        )
+                logger.info(
+                    "🎉 BUGUNGI YUBORISH "
+                    f"YAKUNLANDI: "
+                    f"{sent_count}/"
+                    f"{DAILY_TEST_COUNT}"
+                )
 
-        last_error = None
 
-        logger.info(
-            f"🎉 BUGUNGI YUBORISH YAKUNLANDI: "
-            f"{today_sent}/50"
-        )
+            else:
 
-    except Exception as e:
+                last_error = (
+                    f"Faqat {sent_count}/"
+                    f"{DAILY_TEST_COUNT} "
+                    f"test yuborildi."
+                )
 
-        last_error = str(e)
+                logger.error(
+                    f"⚠️ Yuborish to'liq tugamadi: "
+                    f"{last_error}"
+                )
 
-        logger.exception(
-            f"❌ Kundalik testlar xatosi: {e}"
-        )
+
+            save_state()
+
+
+        except Exception as error:
+
+            last_error = str(
+                error
+            )
+
+            save_state()
+
+            logger.exception(
+                f"❌ Kundalik testlarda "
+                f"xato: {error}"
+            )
+
+
+        finally:
+
+            is_sending = False
 
 
 # ============================================================
-# KEYINGI 08:00 NI TOPISH
+# KEYINGI YUBORISH VAQTINI TOPISH
 # ============================================================
 
 def next_run_time():
@@ -615,19 +1037,74 @@ def next_run_time():
         UZ_TZ
     )
 
+
     target = now.replace(
+
         hour=SEND_HOUR,
+
         minute=SEND_MINUTE,
+
         second=0,
+
         microsecond=0
     )
 
+
     if now >= target:
+
         target += timedelta(
             days=1
         )
 
+
     return target
+
+
+# ============================================================
+# STARTUP PAYTIDA O'TKAZIB YUBORILGAN
+# BUGUNGI ISHNI TEKSHIRISH
+# ============================================================
+
+async def check_missed_run():
+
+    global last_run_date
+
+
+    now = datetime.now(
+        UZ_TZ
+    )
+
+    today = now.date()
+
+
+    scheduled_time = now.replace(
+
+        hour=SEND_HOUR,
+
+        minute=SEND_MINUTE,
+
+        second=0,
+
+        microsecond=0
+    )
+
+
+    # Agar bot belgilangan vaqtdan keyin ishga tushgan bo'lsa
+    # va bugungi testlar hali to'liq yuborilmagan bo'lsa,
+    # avtomatik yuborishni boshlaydi.
+    if (
+        now >= scheduled_time
+        and last_run_date != today
+    ):
+
+        logger.info(
+            "Bugungi rejalashtirilgan yuborish "
+            "hali bajarilmagan."
+        )
+
+        asyncio.create_task(
+            send_daily_tests()
+        )
 
 
 # ============================================================
@@ -637,14 +1114,16 @@ def next_run_time():
 async def daily_scheduler():
 
     logger.info(
-        f"🤖 Avtomatik tizim yoqildi."
+        "🤖 Avtomatik tizim yoqildi."
     )
 
     logger.info(
         f"⏰ Har kuni "
-        f"{SEND_HOUR:02d}:{SEND_MINUTE:02d} "
+        f"{SEND_HOUR:02d}:"
+        f"{SEND_MINUTE:02d} "
         f"Toshkent vaqti."
     )
+
 
     while True:
 
@@ -656,20 +1135,27 @@ async def daily_scheduler():
                 UZ_TZ
             )
 
+
             seconds = (
                 target - now
             ).total_seconds()
 
+
             logger.info(
-                f"⏳ Keyingi 50 ta test: "
+                f"⏳ Keyingi yuborish: "
                 f"{target.strftime('%d.%m.%Y %H:%M:%S')}"
             )
+
 
             await asyncio.sleep(
                 max(seconds, 1)
             )
 
+
+            # Hech qanday buyruqsiz
+            # avtomatik yuborish.
             await send_daily_tests()
+
 
         except asyncio.CancelledError:
 
@@ -679,10 +1165,12 @@ async def daily_scheduler():
 
             break
 
-        except Exception as e:
+
+        except Exception as error:
 
             logger.exception(
-                f"Scheduler xatosi: {e}"
+                f"Scheduler xatosi: "
+                f"{error}"
             )
 
             await asyncio.sleep(
@@ -691,123 +1179,89 @@ async def daily_scheduler():
 
 
 # ============================================================
-# /START
-# ============================================================
-
-@dp.message(Command("start"))
-async def start_command(
-    message: types.Message
-):
-
-    await message.answer(
-        "📚 <b>Tarix Toifa Test Bot</b>\n\n"
-        "🤖 Avtomatik tizim: AKTIV\n"
-        f"⏰ Har kuni: "
-        f"{SEND_HOUR:02d}:{SEND_MINUTE:02d}\n"
-        "📝 Kuniga: 50 ta test\n"
-        "🎯 Toifa imtihoni darajasi\n\n"
-        "/send_now — hozir 50 ta test\n"
-        "/status — holat",
-        parse_mode="HTML"
-    )
-
-
-# ============================================================
-# /SEND_NOW
-# ============================================================
-
-@dp.message(Command("send_now"))
-async def send_now_command(
-    message: types.Message
-):
-
-    await message.answer(
-        "⏳ 50 ta test tayyorlanmoqda...\n"
-        "Bu biroz vaqt olishi mumkin."
-    )
-
-    await send_daily_tests()
-
-    await message.answer(
-        f"📊 Jarayon tugadi.\n"
-        f"Yuborilgan: {today_sent}/50"
-    )
-
-
-# ============================================================
-# /STATUS
-# ============================================================
-
-@dp.message(Command("status"))
-async def status_command(
-    message: types.Message
-):
-
-    now = datetime.now(
-        UZ_TZ
-    )
-
-    next_time = next_run_time()
-
-    if last_run_date == now.date():
-        today_status = "✅ Bugungi testlar yuborilgan"
-    else:
-        today_status = "⏳ Bugungi testlar hali yuborilmagan"
-
-    if last_run_time:
-        last_time = last_run_time.strftime(
-            "%d.%m.%Y %H:%M:%S"
-        )
-    else:
-        last_time = "Hali yo'q"
-
-    await message.answer(
-        "📊 <b>BOT HOLATI</b>\n\n"
-        f"🇺🇿 Hozirgi vaqt: "
-        f"{now.strftime('%d.%m.%Y %H:%M:%S')}\n"
-        f"📝 Bugungi holat: {today_status}\n"
-        f"📊 Bugun yuborilgan: {today_sent}/50\n"
-        f"🕐 Oxirgi yuborish: {last_time}\n"
-        f"⏰ Keyingi yuborish: "
-        f"{next_time.strftime('%d.%m.%Y %H:%M')}\n"
-        f"❌ Xato: "
-        f"{last_error or 'Yo‘q'}",
-        parse_mode="HTML"
-    )
-
-
-# ============================================================
 # MAIN
 # ============================================================
 
 async def main():
 
-    await start_web_server()
-
-    scheduler = asyncio.create_task(
-        daily_scheduler()
+    logger.info(
+        "========================================"
     )
 
     logger.info(
-        "🚀 Telegram bot ishga tushmoqda..."
+        "📚 TARIX TOIFA TEST BOT"
     )
+
+    logger.info(
+        "🤖 Avtomatik rejim"
+    )
+
+    logger.info(
+        f"📝 Kunlik testlar: "
+        f"{DAILY_TEST_COUNT}"
+    )
+
+    logger.info(
+        "========================================"
+    )
+
+
+    # Avvalgi holatni yuklash
+    load_state()
+
+
+    # Render web server
+    web_runner = await start_web_server()
+
+
+    # Scheduler
+    scheduler_task = asyncio.create_task(
+        daily_scheduler()
+    )
+
+
+    # Startup vaqtida o'tkazib yuborilgan
+    # kunlik ishni tekshirish.
+    await check_missed_run()
+
+
+    logger.info(
+        "🚀 Bot to'liq avtomatik rejimda ishga tushdi."
+    )
+
 
     try:
 
+        # Hech qanday command handler bo'lmasa ham
+        # polling botni ishlatib turadi.
         await dp.start_polling(
             bot
         )
 
+
     finally:
 
-        scheduler.cancel()
+        logger.info(
+            "Bot to'xtatilmoqda..."
+        )
+
+
+        scheduler_task.cancel()
+
 
         try:
-            await scheduler
+
+            await scheduler_task
+
         except asyncio.CancelledError:
+
             pass
 
+
         await bot.session.close()
+
+
+        await web_runner.cleanup()
 
 
 # ============================================================
@@ -815,11 +1269,10 @@ async def main():
 # ============================================================
 
 if __name__ == "__main__":
-    asyncio.run(main())
 
-
-
-
+    asyncio.run(
+        main()
+    )
 
 
 
